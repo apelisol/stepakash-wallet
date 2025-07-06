@@ -158,6 +158,9 @@ class DerivDepositController extends Controller
 
     /**
      * Validate CodeIgniter session via API
+     * @param string $sessionId
+     * @return array
+     *  
      */
     private function validateCodeIgniterSession($sessionId)
     {
