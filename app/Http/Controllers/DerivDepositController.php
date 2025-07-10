@@ -3,216 +3,198 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
-use App\Services\DerivWebSocketService;
-use App\Jobs\ProcessDerivDeposit;
-use App\Models\DerivDepositRequest;
+use App\Services\DerivService;
+use App\Services\CodeIgniterBridgeService;
+use Illuminate\Support\Facades\Validator;
+use WebSocket\Client as WebSocketClient;
+use WebSocket\ConnectionException;
 
-class DerivDepositController extends Controller
+class DerivController extends Controller
 {
-    private $derivService;
-    private $codeigniterDb;
+    protected $derivService;
+    protected $bridgeService;
 
-    public function __construct(DerivWebSocketService $derivService)
+    public function __construct(DerivService $derivService, CodeIgniterBridgeService $bridgeService)
     {
         $this->derivService = $derivService;
-
-        // Secondary database connection to CodeIgniter DB
-        $this->codeigniterDb = DB::connection('codeigniter');
+        $this->bridgeService = $bridgeService;
     }
 
     /**
-     * Handle deposit request from CodeIgniter
+     * Handle deposit to Deriv account
      */
-    public function initiateDeposit(Request $request)
+    public function deposit(Request $request)
     {
-        $validated = $request->validate([
-            'session_id' => 'required|string',
-            'cr_number' => 'required|string|min:8|max:12',
+        $validator = Validator::make($request->all(), [
+            'session_id' => 'required',
+            'crNumber' => 'required|min:8|max:12',
             'amount' => 'required|numeric|min:2.5',
-            'transaction_id' => 'required|string',
-            'wallet_id' => 'required|string'
+            'transaction_id' => 'required'
         ]);
 
-        try {
-            // 1. Validate session with CodeIgniter (single API call)
-            $sessionValidation = $this->validateCodeIgniterSession($validated['session_id']);
-
-            if (!$sessionValidation['valid']) {
-                return response()->json([
-                    'status' => 'fail',
-                    'message' => 'Invalid session',
-                    'data' => null
-                ], 401);
-            }
-
-            // 2. Check for duplicate transactions
-            $existingDeposit = DerivDepositRequest::where('transaction_id', $validated['transaction_id'])
-                ->where('status', 1)
-                ->first();
-
-            if ($existingDeposit) {
-                return response()->json([
-                    'status' => 'error',
-                    'message' => 'Transaction already processed',
-                    'data' => null
-                ], 400);
-            }
-
-            // 3. Get user details and validate balance
-            $userDetails = $this->getUserDetails($validated['wallet_id']);
-            $amountUSD = $validated['amount'];
-
-            if ($userDetails['balance_usd'] < $amountUSD) {
-                return response()->json([
-                    'status' => 'error',
-                    'message' => 'Insufficient funds. Your balance is $' . number_format($userDetails['balance_usd'], 2) . ' USD.',
-                    'data' => null
-                ], 400);
-            }
-
-            // 4. Queue the deposit for async processing
-            $depositData = array_merge($validated, [
-                'amount_usd' => $amountUSD,
-                'conversion_rate' => $userDetails['conversion_rate'],
-                'user_phone' => $userDetails['phone'],
-                'status' => 'pending'
-            ]);
-
-            // Save deposit request
-            $depositRequest = DerivDepositRequest::create($depositData);
-
-            // Dispatch async job
-            ProcessDerivDeposit::dispatch($depositRequest->id);
-
+        if ($validator->fails()) {
             return response()->json([
-                'status' => 'success',
-                'message' => 'Deposit request submitted. You will receive confirmation shortly.',
-                'data' => [
-                    'deposit_id' => $depositRequest->id,
-                    'transaction_id' => $validated['transaction_id'],
-                    'amount_usd' => $amountUSD,
-                    'estimated_completion' => now()->addMinutes(2)->toISOString()
-                ]
-            ]);
-        } catch (\Exception $e) {
-            Log::error('Deposit initiation failed', [
-                'error' => $e->getMessage(),
-                'request_data' => $validated
-            ]);
+                'status' => 'fail',
+                'message' => $validator->errors()->first(),
+                'data' => null
+            ], 400);
+        }
 
+        // Validate session with CodeIgniter system
+        $sessionValidation = $this->bridgeService->validateSession($request->session_id);
+
+        if (!$sessionValidation['valid']) {
+            return response()->json([
+                'status' => 'fail',
+                'message' => $sessionValidation['message'],
+                'data' => null
+            ], 401);
+        }
+
+        try {
+            $result = $this->derivService->processDeposit(
+                $request->transaction_id,
+                $sessionValidation['data']['wallet_id'],
+                $request->crNumber,
+                $request->amount,
+                $request->session_id
+            );
+
+            return response()->json($result);
+        } catch (\Exception $e) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'Deposit initiation failed. Please try again.',
+                'message' => 'Processing error: ' . $e->getMessage(),
                 'data' => null
             ], 500);
         }
     }
 
     /**
-     * Check deposit status
+     * Handle withdrawal from Deriv account
      */
-    public function checkDepositStatus(Request $request)
+    public function withdraw(Request $request)
     {
-        $validated = $request->validate([
-            'transaction_id' => 'required|string',
-            'session_id' => 'required|string'
+        $validator = Validator::make($request->all(), [
+            'session_id' => 'required',
+            'crNumber' => 'required|min:8|max:12',
+            'amount' => 'required|numeric|min:2.5'
         ]);
 
-        // Quick session validation
-        $sessionValidation = $this->validateCodeIgniterSession($validated['session_id']);
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'fail',
+                'message' => $validator->errors()->first(),
+                'data' => null
+            ], 400);
+        }
+
+        // Validate session with CodeIgniter system
+        $sessionValidation = $this->bridgeService->validateSession($request->session_id);
+
         if (!$sessionValidation['valid']) {
             return response()->json([
                 'status' => 'fail',
-                'message' => 'Invalid session',
+                'message' => $sessionValidation['message'],
                 'data' => null
             ], 401);
         }
 
-        $deposit = DerivDepositRequest::where('transaction_id', $validated['transaction_id'])->first();
+        try {
+            $result = $this->derivService->processWithdrawal(
+                $sessionValidation['data']['wallet_id'],
+                $request->crNumber,
+                $request->amount,
+                $request->session_id
+            );
 
-        if (!$deposit) {
+            return response()->json($result);
+        } catch (\Exception $e) {
             return response()->json([
                 'status' => 'error',
-                'message' => 'Deposit not found',
+                'message' => 'Processing error: ' . $e->getMessage(),
                 'data' => null
-            ], 404);
+            ], 500);
         }
-
-        return response()->json([
-            'status' => 'success',
-            'message' => 'Deposit status retrieved',
-            'data' => [
-                'transaction_id' => $deposit->transaction_id,
-                'status' => $deposit->status,
-                'amount_usd' => $deposit->amount_usd,
-                'cr_number' => $deposit->cr_number,
-                'created_at' => $deposit->created_at,
-                'completed_at' => $deposit->completed_at,
-                'error_message' => $deposit->error_message
-            ]
-        ]);
     }
 
     /**
-     * Validate CodeIgniter session via API
-     * @param string $sessionId
-     * @return array
-     *  
+     * Process deposit callback from Deriv
      */
-    private function validateCodeIgniterSession($sessionId)
+    public function processDeposit(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'request_id' => 'required'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'fail',
+                'message' => 'Request ID is required',
+                'data' => null
+            ], 400);
+        }
+
+        try {
+            $result = $this->derivService->completeDeposit($request->request_id);
+            return response()->json($result);
+        } catch (\Exception $e) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Processing error: ' . $e->getMessage(),
+                'data' => null
+            ], 500);
+        }
+    }
+
+    /**
+     * Process withdrawal callback from Deriv
+     */
+    public function processWithdrawal(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'request_id' => 'required'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'fail',
+                'message' => 'Request ID is required',
+                'data' => null
+            ], 400);
+        }
+
+        try {
+            $result = $this->derivService->completeWithdrawal($request->request_id);
+            return response()->json($result);
+        } catch (\Exception $e) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Processing error: ' . $e->getMessage(),
+                'data' => null
+            ], 500);
+        }
+    }
+
+    /**
+     * Get transactions for a wallet
+     */
+    public function getTransactions($wallet_id)
     {
         try {
-            $response = Http::timeout(10)->post(config('services.codeigniter.base_url') . '/checkDerivSession', [
-                'session_id' => $sessionId
+            $transactions = $this->bridgeService->getTransactions($wallet_id);
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Transactions retrieved',
+                'data' => $transactions
             ]);
-
-            if ($response->successful()) {
-                $data = $response->json();
-                return [
-                    'valid' => $data['status'] === 'success',
-                    'data' => $data['data'] ?? null
-                ];
-            }
-
-            return ['valid' => false, 'data' => null];
         } catch (\Exception $e) {
-            Log::error('Session validation failed', ['error' => $e->getMessage()]);
-            return ['valid' => false, 'data' => null];
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Failed to retrieve transactions: ' . $e->getMessage(),
+                'data' => null
+            ], 500);
         }
-    }
-
-    /**
-     * Get user details from CodeIgniter database
-     */
-    private function getUserDetails($walletId)
-    {
-        $summary = $this->codeigniterDb->table('customer_transection_summary')
-            ->where('wallet_id', $walletId)
-            ->first();
-
-        $buyRate = $this->codeigniterDb->table('exchange')
-            ->where('exchange_type', 1)
-            ->where('service_type', 1)
-            ->first();
-
-        $user = $this->codeigniterDb->table('customers')
-            ->where('wallet_id', $walletId)
-            ->first();
-
-        $totalCredit = (float) str_replace(',', '', $summary->total_credit ?? 0);
-        $totalDebit = (float) str_replace(',', '', $summary->total_debit ?? 0);
-        $balanceKes = $totalCredit - $totalDebit;
-        $conversionRate = $buyRate->kes ?? 1;
-
-        return [
-            'balance_kes' => $balanceKes,
-            'balance_usd' => $balanceKes / $conversionRate,
-            'conversion_rate' => $conversionRate,
-            'phone' => $user->phone ?? '',
-            'bought_at' => $buyRate->bought_at ?? 0
-        ];
     }
 }
